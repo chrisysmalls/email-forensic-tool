@@ -1,4 +1,4 @@
 streamlit
 pandas
 reportlab
-extract_msg
+msg_parser[rtf]
