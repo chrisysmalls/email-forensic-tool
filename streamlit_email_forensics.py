@@ -237,6 +237,60 @@ def generate_single_pdf(msg):
 
 
 # ----------------------------------------
+# Split-Zip Helper for Attachments
+# ----------------------------------------
+def create_split_zips(attachments_storage, size_limit=190 * 1024 * 1024):
+    """
+    Given attachments_storage (key -> bytes), create multiple ZIP files beneath size_limit.
+    Returns list of (zip_filename, zip_bytes).
+    """
+    items = list(attachments_storage.items())  # [(key, data), ...]
+    zips = []
+    current_zip_bytes = None
+    current_zip_file = None
+    current_size = 0
+    part_index = 1
+
+    def finalize_zip(zf, tmp_path, part_idx):
+        zf.close()
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+        os.unlink(tmp_path)
+        return data
+
+    # Create first ZIP
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    current_zip_file = tmp.name
+    zf = zipfile.ZipFile(current_zip_file, mode="w", compression=zipfile.ZIP_DEFLATED)
+    current_size = 0
+
+    for key, data in items:
+        fname = key.split("_", 1)[1]  # original filename
+        data_size = len(data)
+        # If adding this file exceeds size_limit, finalize current ZIP and start new
+        if current_size + data_size > size_limit and current_size > 0:
+            zip_bytes = finalize_zip(zf, current_zip_file, part_index)
+            zips.append((f"attachments_part{part_index}.zip", zip_bytes))
+            part_index += 1
+            # Start new ZIP
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+            current_zip_file = tmp.name
+            zf = zipfile.ZipFile(current_zip_file, mode="w", compression=zipfile.ZIP_DEFLATED)
+            current_size = 0
+
+        # Write this attachment to the current ZIP
+        zf.writestr(fname, data)
+        current_size += data_size
+
+    # Finalize last ZIP
+    if zf and current_size >= 0:
+        zip_bytes = finalize_zip(zf, current_zip_file, part_index)
+        zips.append((f"attachments_part{part_index}.zip", zip_bytes))
+
+    return zips
+
+
+# ----------------------------------------
 # Streamlit Interface
 # ----------------------------------------
 st.title("Email Forensic Tool (.msg ZIP)")
@@ -244,7 +298,8 @@ st.title("Email Forensic Tool (.msg ZIP)")
 st.write(
     "Upload a ZIP containing `.msg` files (eDiscovery export). "
     "The app will extract and parse every .msg, then present a searchable table, "
-    "including each email’s body and any attachments."
+    "including each email’s body and any attachments. "
+    "You can also download all attachments split into multiple ZIP parts under 190 MB each."
 )
 
 uploaded = st.file_uploader(
@@ -346,6 +401,29 @@ if uploaded:
             key="download_filtered_pdf"
         )
 
+        # Split and download all attachments from filtered messages
+        # Gather keys of attachments present in filtered messages
+        filtered_keys = []
+        for msg in filtered:
+            for _, key in msg["attachments"]:
+                filtered_keys.append(key)
+
+        if filtered_keys:
+            # Build a sub-dictionary of attachments_storage
+            filtered_attachments = {k: attachments_storage[k] for k in filtered_keys}
+            parts = create_split_zips(filtered_attachments)
+            st.write("## Download Attachments (Split ZIPs)")
+            for part_name, part_bytes in parts:
+                st.download_button(
+                    f"Download {part_name}",
+                    data=part_bytes,
+                    file_name=part_name,
+                    mime="application/zip",
+                    key=f"download_attach_part_{part_name}"
+                )
+        else:
+            st.info("No attachments to download for the filtered messages.")
+
         # Detailed view for a single message
         st.write("## Message Details & Attachments")
         idx_list = disp_df.index.tolist()
@@ -363,7 +441,6 @@ if uploaded:
                 fn, key = att
                 data = attachments_storage.get(key)
                 if data:
-                    # Unique key per attachment per message
                     st.download_button(
                         f"Download {fn}",
                         data=data,
