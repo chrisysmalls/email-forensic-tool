@@ -4,45 +4,92 @@ import tempfile
 import pandas as pd
 import streamlit as st
 from datetime import datetime
+
+# ReportLab for PDF export
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 
 # ----------------------------------------
-# CSV Parsing
+# CSV Parsing with Auto‐Column Detection
 # ----------------------------------------
 @st.cache_data
 def parse_csv(file_obj):
     """
-    Parse a CSV report (e.g. from Microsoft eDiscovery).
-    Expects columns: DeliveryDate (optional), Subject, From, To, CC, BCC, Body, [Attachments].
-    If an 'Attachments' column exists, it should be semicolon-separated filenames.
-    """
-    # Peek at header to check for DeliveryDate
-    df_header = pd.read_csv(file_obj, nrows=0)
-    parse_dates = ["DeliveryDate"] if "DeliveryDate" in df_header.columns else None
+    Parse a CSV report with flexible column detection.
+    Detects columns (case‐insensitive) for:
+      - date (any column containing 'date' or 'sent')
+      - subject (containing 'subject')
+      - sender (containing 'from' or 'sender')
+      - recipients: 'to', 'cc', 'bcc' (combines all found)
+      - body (containing 'body', 'content', or 'text')
+      - attachments (containing 'attach')
 
-    file_obj.seek(0)
-    df = pd.read_csv(file_obj, encoding="utf-8", errors="ignore", parse_dates=parse_dates)
+    Returns:
+      - messages: list of dicts with fields:
+          date (datetime or timestamp 0),
+          subject, sender, recipients, body,
+          emails_in_body, phones_in_body, attachments (list of filenames)
+      - column_map: mapping of detected column names (for reference)
+    """
+    df = pd.read_csv(file_obj, encoding="utf-8", errors="ignore")
+    cols = list(df.columns)
+    cols_lower = [c.lower() for c in cols]
+
+    def find_col(substrings):
+        for substr in substrings:
+            for i, lower in enumerate(cols_lower):
+                if substr in lower:
+                    return cols[i]
+        return None
+
+    date_col = find_col(["deliverydate", "date", "sent"])
+    subject_col = find_col(["subject"])
+    sender_col = find_col(["from", "sender"])
+    to_col = find_col([" to", " to ", " to$", "^to$", "recipient"])
+    cc_col = find_col(["cc"])
+    bcc_col = find_col(["bcc"])
+    body_col = find_col(["body", "content", "text"])
+    attach_col = find_col(["attach"])
+
+    if date_col:
+        try:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        except Exception:
+            df[date_col] = pd.to_datetime(df[date_col].astype(str), errors="coerce")
 
     messages = []
-    has_attachments_col = "Attachments" in df.columns
-
     for _, row in df.iterrows():
-        subject = row.get("Subject", "") or ""
-        sender = row.get("From", "") or ""
-        rec_to = row.get("To", "") or ""
-        rec_cc = row.get("CC", "") or ""
-        rec_bcc = row.get("BCC", "") or ""
-        recipients = ", ".join(filter(None, [rec_to, rec_cc, rec_bcc]))
-
-        if "DeliveryDate" in row and not pd.isna(row.get("DeliveryDate")):
-            date = pd.to_datetime(row.get("DeliveryDate")).to_pydatetime()
+        if date_col and not pd.isna(row.get(date_col)):
+            date = row.get(date_col)
+            if not isinstance(date, datetime):
+                try:
+                    date = pd.to_datetime(date).to_pydatetime()
+                except Exception:
+                    date = datetime.fromtimestamp(0)
         else:
             date = datetime.fromtimestamp(0)
 
-        body = row.get("Body", "") or ""
+        subject = str(row.get(subject_col, "")) if subject_col else ""
+        sender = str(row.get(sender_col, "")) if sender_col else ""
+
+        rec_list = []
+        if to_col:
+            rec_to = str(row.get(to_col, "")) or ""
+            if rec_to:
+                rec_list.append(rec_to)
+        if cc_col:
+            rec_cc = str(row.get(cc_col, "")) or ""
+            if rec_cc:
+                rec_list.append(rec_cc)
+        if bcc_col:
+            rec_bcc = str(row.get(bcc_col, "")) or ""
+            if rec_bcc:
+                rec_list.append(rec_bcc)
+        recipients = ", ".join(rec_list)
+
+        body = str(row.get(body_col, "")) if body_col else ""
         emails_in_body = re.findall(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", body)
         phones_in_body = re.findall(
             r"(\+?\d{1,3}[-\.\s]?)?\(?\d{3}\)?[-\.\s]?\d{3}[-\.\s]?\d{4}", body
@@ -52,8 +99,8 @@ def parse_csv(file_obj):
         phones_in_body = list(set(phones_in_body))
 
         attachments = []
-        if has_attachments_col:
-            raw = row.get("Attachments", "") or ""
+        if attach_col:
+            raw = str(row.get(attach_col, "")) or ""
             for fn in raw.split(";"):
                 fn = fn.strip()
                 if fn:
@@ -70,8 +117,17 @@ def parse_csv(file_obj):
             "attachments": attachments,
         })
 
-    return messages
-
+    column_map = {
+        "date": date_col,
+        "subject": subject_col,
+        "sender": sender_col,
+        "to": to_col,
+        "cc": cc_col,
+        "bcc": bcc_col,
+        "body": body_col,
+        "attachments": attach_col
+    }
+    return messages, column_map
 
 # ----------------------------------------
 # CSV / PDF Export Helpers
@@ -149,28 +205,61 @@ def generate_pdf_download(filtered_messages):
     os.unlink(buffer.name)
     return data
 
+def generate_single_pdf(msg):
+    """
+    Create a PDF (bytes) for a single message, with detailed view.
+    """
+    buffer = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    doc = SimpleDocTemplate(buffer.name, pagesize=letter)
+    elements = []
+    styles = getSampleStyleSheet()
+
+    # Headers
+    elements.append(Paragraph(f"Date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]))
+    elements.append(Paragraph(f"Subject: {msg['subject']}", styles["Normal"]))
+    elements.append(Paragraph(f"Sender: {msg['sender']}", styles["Normal"]))
+    elements.append(Paragraph(f"Recipients: {msg['recipients']}", styles["Normal"]))
+
+    if msg["attachments"]:
+        elements.append(Spacer(1, 12))
+        elements.append(Paragraph("Attachments:", styles["Normal"]))
+        for fn in msg["attachments"]:
+            elements.append(Paragraph(f"• {fn}", styles["Normal"]))
+
+    # Body
+    elements.append(Spacer(1, 12))
+    elements.append(Paragraph("Body:", styles["Normal"]))
+    for line in msg["body"].split("\n"):
+        if line.strip() == "":
+            elements.append(Spacer(1, 6))
+        else:
+            elements.append(Paragraph(line, styles["Normal"]))
+
+    doc.build(elements)
+    with open(buffer.name, "rb") as f:
+        data = f.read()
+    os.unlink(buffer.name)
+    return data
 
 # ----------------------------------------
 # Streamlit Interface
 # ----------------------------------------
 st.title("Email Forensic Tool (CSV-Only)")
 
-st.write(
-    "Upload a CSV export from Microsoft eDiscovery (or from Outlook). "
-    "Columns should include: DeliveryDate (optional), Subject, From, To, CC, BCC, Body, [Attachments]."
-)
-
-uploaded = st.file_uploader("Upload CSV file", type=["csv"])
+uploaded = st.file_uploader("Upload a CSV file", type=["csv"])
 
 if uploaded:
     with st.spinner("Parsing CSV…"):
         try:
-            messages = parse_csv(uploaded)
+            messages, column_map = parse_csv(uploaded)
         except Exception as e:
             st.error(f"Failed to parse CSV: {e}")
             st.stop()
 
-    # Build DataFrame to display & filter
+    st.write("**Detected columns:**")
+    for key, col in column_map.items():
+        st.write(f"- {key.capitalize()}: {col or '—'}")
+
     df = pd.DataFrame([{
         "Date": msg.get("date"),
         "Subject": msg.get("subject"),
@@ -182,28 +271,34 @@ if uploaded:
         "Index": i
     } for i, msg in enumerate(messages)])
 
-    # Sidebar filters
     st.sidebar.header("Filters")
     subj_filter = st.sidebar.text_input("Subject contains")
     sender_filter = st.sidebar.text_input("Sender contains")
-    rec_filter = st.sidebar.text_input("Recipient contains")
+    rec_filter = st.sidebar.text_input("Communicated with (email/domain)")
     email_filter = st.sidebar.text_input("Email in body contains")
     phone_filter = st.sidebar.text_input("Phone in body contains")
+    body_filter = st.sidebar.text_input("Body contains (any text/address/etc.)")
+    has_attach = st.sidebar.checkbox("Only show messages with attachments")
     start_date = st.sidebar.date_input("Start date", value=datetime(2000, 1, 1).date())
     end_date = st.sidebar.date_input("End date", value=datetime.today().date())
 
-    # Apply filters
     filtered = []
     for msg in messages:
         if subj_filter and subj_filter.lower() not in msg["subject"].lower():
             continue
         if sender_filter and sender_filter.lower() not in msg["sender"].lower():
             continue
-        if rec_filter and rec_filter.lower() not in msg["recipients"].lower():
-            continue
+        if rec_filter:
+            low = rec_filter.lower()
+            if low not in msg["sender"].lower() and low not in msg["recipients"].lower():
+                continue
         if email_filter and email_filter.lower() not in msg["emails_in_body"].lower():
             continue
         if phone_filter and phone_filter.lower() not in msg["phones_in_body"].lower():
+            continue
+        if body_filter and body_filter.lower() not in msg["body"].lower():
+            continue
+        if has_attach and len(msg["attachments"]) == 0:
             continue
         msg_date = msg["date"]
         if msg_date:
@@ -226,7 +321,6 @@ if uploaded:
         disp_df["Date"] = disp_df["Date"].dt.strftime("%Y-%m-%d %H:%M:%S")
         st.dataframe(disp_df.set_index("Index"), height=400)
 
-        # Export buttons
         st.download_button(
             "Download Filtered as CSV",
             data=generate_csv_download(filtered),
@@ -240,7 +334,6 @@ if uploaded:
             mime="application/pdf"
         )
 
-        # Show message details & attachments
         st.write("## Message Details & Attachments")
         idx_list = disp_df.index.tolist()
         selected_index = st.selectbox("Select message by Index", options=idx_list)
@@ -258,5 +351,14 @@ if uploaded:
 
         st.write("**Body:**")
         st.write(msg["body"])
+
+        # Download single-message report as PDF
+        pdf_data = generate_single_pdf(msg)
+        st.download_button(
+            "Download This Message as PDF",
+            data=pdf_data,
+            file_name=f"message_{selected_index}.pdf",
+            mime="application/pdf"
+        )
     else:
         st.info("No messages match the current filters.")
