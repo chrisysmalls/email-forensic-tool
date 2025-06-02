@@ -1,6 +1,7 @@
 import os
 import re
 import tempfile
+import zipfile
 import pandas as pd
 import streamlit as st
 from datetime import datetime
@@ -15,21 +16,10 @@ from reportlab.lib.styles import getSampleStyleSheet
 import extract_msg
 
 # ----------------------------------------
-# CSV Parsing with Auto‐Column Detection
+# CSV Parsing with Auto-Column Detection
 # ----------------------------------------
 @st.cache_data
 def parse_csv(file_obj):
-    """
-    Parse a CSV report with flexible column detection.
-    Detects columns (case‐insensitive) for:
-      - date (any column containing 'date' or 'sent')
-      - subject (containing 'subject')
-      - sender (containing 'from' or 'sender')
-      - recipients: 'to', 'cc', 'bcc' (combines all found)
-      - body (containing 'body', 'content', or 'text')
-      - attachments (containing 'attach')
-    Returns messages (list of dicts) and column_map.
-    """
     df = pd.read_csv(file_obj, encoding="utf-8")
     cols = list(df.columns)
     cols_lower = [c.lower() for c in cols]
@@ -131,15 +121,10 @@ def parse_csv(file_obj):
 # ----------------------------------------
 @st.cache_data
 def parse_msg_files(msg_files):
-    """
-    Parse a list of .msg files (UploadedFile objects).
-    Returns messages (list of dicts) and attachments_storage {key: bytes}.
-    """
     messages = []
     attachments_storage = {}
 
     for uploaded in msg_files:
-        # Save to temp file for extract_msg
         with tempfile.NamedTemporaryFile(delete=False, suffix=".msg") as tmp:
             tmp.write(uploaded.read())
             tmp_path = tmp.name
@@ -154,13 +139,11 @@ def parse_msg_files(msg_files):
         except Exception:
             msg_date = datetime.fromtimestamp(0)
 
-        # Recipients: To, CC, BCC fields from extract_msg
         to_field = msg.to or ""
         cc_field = msg.cc or ""
         bcc_field = msg.bcc or ""
         recipients = ", ".join(filter(None, [to_field, cc_field, bcc_field]))
 
-        # Body (plaintext)
         body = msg.body or ""
         emails_in_body = re.findall(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", body)
         phones_in_body = re.findall(
@@ -170,7 +153,6 @@ def parse_msg_files(msg_files):
         phones_in_body = ["".join(p) for p in phones_in_body]
         phones_in_body = list(set(phones_in_body))
 
-        # Attachments: extract_msg gives msg.attachments (list)
         attachments = []
         for att in msg.attachments:
             fname = att.longFilename or att.shortFilename or "attachment"
@@ -196,10 +178,45 @@ def parse_msg_files(msg_files):
     return messages, attachments_storage
 
 # ----------------------------------------
+# Zip Handling: extract all .msg files inside
+# ----------------------------------------
+@st.cache_data
+def parse_zip_file(uploaded_zip):
+    """
+    Extracts .msg files from uploaded ZIP, then parses them.
+    Returns combined messages list and attachments_storage dict.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, uploaded_zip.name)
+        with open(zip_path, "wb") as f:
+            f.write(uploaded_zip.read())
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(tmpdir)
+
+        # Walk through extracted folder, collect all .msg files
+        msg_file_paths = []
+        for root, _, files in os.walk(tmpdir):
+            for name in files:
+                if name.lower().endswith(".msg"):
+                    msg_file_paths.append(os.path.join(root, name))
+
+        # For each file path, create a pseudo-UploadedFile-like object
+        class _TmpUploaded:
+            def __init__(self, path):
+                self.name = os.path.basename(path)
+                self._path = path
+            def read(self):
+                with open(self._path, "rb") as f:
+                    return f.read()
+
+        msg_uploads = [_TmpUploaded(p) for p in msg_file_paths]
+        return parse_msg_files(msg_uploads)
+
+# ----------------------------------------
 # CSV / PDF Export Helpers
 # ----------------------------------------
 @st.cache_data
-def generate_csv_download(filtered_messages):
+def generate_csv_download(messages):
     df = pd.DataFrame([{
         "Date": msg.get("date"),
         "Subject": msg.get("subject"),
@@ -212,7 +229,7 @@ def generate_csv_download(filtered_messages):
             for att in msg.get("attachments", [])
         ]),
         "Body": msg.get("body"),
-    } for msg in filtered_messages])
+    } for msg in messages])
 
     if not df.empty and isinstance(df.loc[0, "Date"], datetime):
         df["Date"] = df["Date"].dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -220,7 +237,7 @@ def generate_csv_download(filtered_messages):
     return df.to_csv(index=False).encode("utf-8")
 
 @st.cache_data
-def generate_pdf_download(filtered_messages):
+def generate_pdf_download(messages):
     buffer = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     doc = SimpleDocTemplate(buffer.name, pagesize=letter)
     elements = []
@@ -235,7 +252,7 @@ def generate_pdf_download(filtered_messages):
         "Emails In Body", "Phones In Body", "Attachments"
     ]]
 
-    for msg in filtered_messages:
+    for msg in messages:
         date_str = msg["date"].strftime("%Y-%m-%d %H:%M:%S") if msg.get("date") else ""
         attachments_text = ";".join([
             att if isinstance(att, str) else att[0]
@@ -272,9 +289,6 @@ def generate_pdf_download(filtered_messages):
     return data
 
 def generate_single_pdf(msg):
-    """
-    Create a PDF (bytes) for a single message, formatted as a detailed report.
-    """
     buffer = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     doc = SimpleDocTemplate(buffer.name, pagesize=letter)
     elements = []
@@ -308,22 +322,23 @@ def generate_single_pdf(msg):
 # ----------------------------------------
 # Streamlit Interface
 # ----------------------------------------
-st.title("Email Forensic Tool (.csv + .msg)")
+st.title("Email Forensic Tool (.csv, .msg, or ZIP of .msg)")
 
 uploaded = st.file_uploader(
-    "Upload CSV or .msg files (multi‐select allowed for .msg)",
-    type=["csv", "msg"], accept_multiple_files=True
+    "Upload a CSV, one or more .msg files, or a ZIP containing .msg files",
+    type=["csv", "msg", "zip"], accept_multiple_files=True
 )
 
 if uploaded:
-    # Separate .csv and .msg uploads
-    csv_files = [u for u in uploaded if u.name.lower().endswith(".csv")]
-    msg_files = [u for u in uploaded if u.name.lower().endswith(".msg")]
-
     messages = []
     attachments_storage = {}
 
-    # Parse any CSVs
+    # Separate uploads
+    csv_files = [u for u in uploaded if u.name.lower().endswith(".csv")]
+    msg_files = [u for u in uploaded if u.name.lower().endswith(".msg")]
+    zip_files = [u for u in uploaded if u.name.lower().endswith(".zip")]
+
+    # Parse CSVs
     for csv_file in csv_files:
         with st.spinner(f"Parsing CSV: {csv_file.name}..."):
             try:
@@ -333,7 +348,7 @@ if uploaded:
                 st.error(f"Failed to parse CSV {csv_file.name}: {e}")
                 st.stop()
 
-    # Parse any .msgs
+    # Parse standalone .msg files
     if msg_files:
         with st.spinner("Parsing .msg files..."):
             try:
@@ -341,14 +356,25 @@ if uploaded:
                 messages.extend(msgs)
                 attachments_storage.update(attach_store)
             except Exception as e:
-                st.error(f"Failed to parse .msg: {e}")
+                st.error(f"Failed to parse .msg files: {e}")
+                st.stop()
+
+    # Parse ZIPs of .msg
+    for zip_file in zip_files:
+        with st.spinner(f"Extracting ZIP: {zip_file.name}..."):
+            try:
+                msgs, attach_store = parse_zip_file(zip_file)
+                messages.extend(msgs)
+                attachments_storage.update(attach_store)
+            except Exception as e:
+                st.error(f"Failed to parse ZIP {zip_file.name}: {e}")
                 st.stop()
 
     if not messages:
         st.info("No messages found in uploads.")
         st.stop()
 
-    # Build DataFrame to display/filter
+    # Build DataFrame for display/filter
     df = pd.DataFrame([{
         "Date": msg.get("date"),
         "Subject": msg.get("subject"),
@@ -361,6 +387,7 @@ if uploaded:
     } for i, msg in enumerate(messages)])
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
     st.sidebar.header("Filters")
     subj_filter = st.sidebar.text_input("Subject contains")
     sender_filter = st.sidebar.text_input("Sender contains")
