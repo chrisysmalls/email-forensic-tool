@@ -335,19 +335,21 @@ if uploaded:
             "Download Filtered as CSV",
             data=generate_csv_download(filtered),
             file_name="filtered_emails.csv",
-            mime="text/csv"
+            mime="text/csv",
+            key="download_filtered_csv"
         )
         st.download_button(
             "Download Filtered as PDF",
             data=generate_pdf_download(filtered),
             file_name="filtered_emails.pdf",
-            mime="application/pdf"
+            mime="application/pdf",
+            key="download_filtered_pdf"
         )
 
         # Detailed view for a single message
         st.write("## Message Details & Attachments")
         idx_list = disp_df.index.tolist()
-        selected_index = st.selectbox("Select message by Index", options=idx_list)
+        selected_index = st.selectbox("Select message by Index", options=idx_list, key="select_message")
         msg = [m for i, m in enumerate(messages) if i == selected_index][0]
 
         st.write(f"**Date:** {msg['date'].strftime('%Y-%m-%d %H:%M:%S')}")
@@ -357,11 +359,17 @@ if uploaded:
 
         if msg["attachments"]:
             st.write("**Attachments:**")
-            for att in msg["attachments"]:
+            for att_index, att in enumerate(msg["attachments"]):
                 fn, key = att
                 data = attachments_storage.get(key)
                 if data:
-                    st.download_button(f"Download {fn}", data=data, file_name=fn)
+                    # Unique key per attachment per message
+                    st.download_button(
+                        f"Download {fn}",
+                        data=data,
+                        file_name=fn,
+                        key=f"download_attach_{selected_index}_{att_index}"
+                    )
 
         st.write("**Body:**")
         st.write(msg["body"])
@@ -372,7 +380,8 @@ if uploaded:
             "Download This Message as PDF",
             data=single_pdf,
             file_name=f"message_{selected_index}.pdf",
-            mime="application/pdf"
+            mime="application/pdf",
+            key=f"download_msg_pdf_{selected_index}"
         )
     else:
         st.info("No messages match the current filters.")
