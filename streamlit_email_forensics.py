@@ -1,5 +1,4 @@
 import os
-import re
 import tempfile
 import zipfile
 import pandas as pd
@@ -12,16 +11,16 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 
-# extract_msg for parsing .msg files
-import extract_msg
+# msg_parser for parsing .msg files (incl. RTF→HTML)
+from msg_parser import MsOxMessage
 
 # ----------------------------------------
-# .msg Parsing
+# .msg Parsing via msg_parser
 # ----------------------------------------
 @st.cache_data
 def parse_msg_files(_msg_files):
     """
-    Parse a list of .msg files (UploadedFile-like objects).
+    Parse a list of .msg files (UploadedFile-like objects) using msg_parser.
     Returns (messages, attachments_storage).
     - messages: list of dicts with keys:
         date (datetime), subject, sender, recipients, body,
@@ -32,43 +31,60 @@ def parse_msg_files(_msg_files):
     attachments_storage = {}
 
     for uploaded in _msg_files:
-        # Write to temp file so extract_msg can process
+        # Save UploadedFile to a temp .msg
         with tempfile.NamedTemporaryFile(delete=False, suffix=".msg") as tmp:
             tmp.write(uploaded.read())
             tmp_path = tmp.name
 
-        msg = extract_msg.Message(tmp_path)
-        msg_sender = msg.sender or ""
-        msg_subject = msg.subject or ""
+        # Parse with msg_parser
+        msg = MsOxMessage(tmp_path)
+        props = msg.get_properties()
 
-        try:
-            msg_date = msg.date
-            if isinstance(msg_date, str):
-                msg_date = datetime.strptime(msg_date, "%m/%d/%Y %I:%M:%S %p")
-        except Exception:
-            msg_date = datetime.fromtimestamp(0)
+        # Date
+        msg_date = props.get("DeliveryTime") or props.get("SentOn") or None
+        if isinstance(msg_date, str):
+            try:
+                msg_date = datetime.fromisoformat(msg_date)
+            except Exception:
+                msg_date = None
+        if not isinstance(msg_date, datetime):
+            msg_date = None
 
-        to_field = msg.to or ""
-        cc_field = msg.cc or ""
-        bcc_field = msg.bcc or ""
-        recipients = ", ".join(filter(None, [to_field, cc_field, bcc_field]))
+        # Subject, Sender
+        msg_subject = props.get("Subject", "")
+        msg_sender = props.get("SenderName", "") or props.get("FromDisplayName", "")
 
-        body = msg.body or ""
+        # Recipients: 'To', 'Cc', 'Bcc'
+        to_list = props.get("To", []) or []
+        cc_list = props.get("Cc", []) or []
+        bcc_list = props.get("Bcc", []) or []
+        recipients = ", ".join(to_list + cc_list + bcc_list)
+
+        # Body: prefer HTML, fallback to plain text
+        html_body = props.get("Html", "").strip() or None
+        text_body = props.get("Body", "").strip() or None
+        # Use HTML if available; otherwise plain text
+        body = html_body or text_body or ""
+
+        # Extract email addresses & phone numbers from the body text
+        import re
         emails_in_body = re.findall(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", body)
         phones_in_body = re.findall(
             r"(\+?\d{1,3}[-\.\s]?)?\(?\d{3}\)?[-\.\s]?\d{3}[-\.\s]?\d{4}", body
         )
-        emails_in_body = list(set(emails_in_body))
+        emails_in_body = list(dict.fromkeys(emails_in_body))
         phones_in_body = ["".join(p) for p in phones_in_body]
-        phones_in_body = list(set(phones_in_body))
+        phones_in_body = list(dict.fromkeys(phones_in_body))
 
-        attachments = []
+        # Attachments: msg_parser returns a list of dicts with 'filename' and 'data'
         for att in msg.attachments:
-            fname = att.longFilename or att.shortFilename or "attachment"
-            data = att.data
+            fname = att.get("filename", "attachment")
+            data = att.get("content", b"")
             key = f"{len(attachments_storage)}_{fname}"
             attachments_storage[key] = data
-            attachments.append((fname, key))
+
+        attachment_list = [(att["filename"], f"{i}_{att['filename']}") 
+                           for i, att in enumerate(msg.attachments)]
 
         messages.append({
             "date": msg_date,
@@ -78,7 +94,7 @@ def parse_msg_files(_msg_files):
             "body": body,
             "emails_in_body": ", ".join(emails_in_body),
             "phones_in_body": ", ".join(phones_in_body),
-            "attachments": attachments,
+            "attachments": attachment_list,
         })
 
         msg.close()
@@ -88,12 +104,12 @@ def parse_msg_files(_msg_files):
 
 
 # ----------------------------------------
-# ZIP Handling: extract .msg files inside
+# ZIP Handling: extract .msg files
 # ----------------------------------------
 @st.cache_data
 def parse_zip_file(uploaded_zip):
     """
-    Extract all .msg files from uploaded ZIP and parse them.
+    Extract all .msg files from the uploaded ZIP and parse them via msg_parser.
     Returns (messages, attachments_storage).
     """
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -135,10 +151,7 @@ def generate_csv_download(messages):
         "Recipients": msg.get("recipients"),
         "EmailsInBody": msg.get("emails_in_body"),
         "PhonesInBody": msg.get("phones_in_body"),
-        "Attachments": ";".join([
-            att if isinstance(att, str) else att[0]
-            for att in msg.get("attachments", [])
-        ]),
+        "Attachments": ";".join([att[0] for att in msg.get("attachments", [])]),
         "Body": msg.get("body"),
     } for msg in messages])
 
@@ -166,10 +179,7 @@ def generate_pdf_download(messages):
 
     for msg in messages:
         date_str = msg["date"].strftime("%Y-%m-%d %H:%M:%S") if msg.get("date") else ""
-        attachments_text = ";".join([
-            att if isinstance(att, str) else att[0]
-            for att in msg.get("attachments", [])
-        ])
+        attachments_text = ";".join([att[0] for att in msg.get("attachments", [])])
 
         row = [
             date_str,
@@ -210,6 +220,7 @@ def generate_single_pdf(msg):
     elements = []
     styles = getSampleStyleSheet()
 
+    # Headers
     elements.append(Paragraph(f"Date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]))
     elements.append(Paragraph(f"Subject: {msg['subject']}", styles["Normal"]))
     elements.append(Paragraph(f"Sender: {msg['sender']}", styles["Normal"]))
@@ -218,9 +229,10 @@ def generate_single_pdf(msg):
     if msg["attachments"]:
         elements.append(Spacer(1, 12))
         elements.append(Paragraph("Attachments:", styles["Normal"]))
-        for fn in msg["attachments"]:
+        for fn, _ in msg["attachments"]:
             elements.append(Paragraph(f"• {fn}", styles["Normal"]))
 
+    # Body
     elements.append(Spacer(1, 12))
     elements.append(Paragraph("Body:", styles["Normal"]))
     for line in msg["body"].split("\n"):
@@ -244,47 +256,45 @@ def create_split_zips(attachments_storage, size_limit=190 * 1024 * 1024):
     Given attachments_storage (key -> bytes), create multiple ZIP files beneath size_limit.
     Returns list of (zip_filename, zip_bytes).
     """
-    items = list(attachments_storage.items())  # [(key, data), ...]
+    items = list(attachments_storage.items())
     zips = []
-    current_zip_bytes = None
     current_zip_file = None
+    current_zip = None
     current_size = 0
     part_index = 1
 
-    def finalize_zip(zf, tmp_path, part_idx):
+    def finalize_zip(zf, tmp_path):
         zf.close()
         with open(tmp_path, "rb") as f:
             data = f.read()
         os.unlink(tmp_path)
         return data
 
-    # Create first ZIP
+    # Start first ZIP
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     current_zip_file = tmp.name
     zf = zipfile.ZipFile(current_zip_file, mode="w", compression=zipfile.ZIP_DEFLATED)
     current_size = 0
 
     for key, data in items:
-        fname = key.split("_", 1)[1]  # original filename
-        data_size = len(data)
-        # If adding this file exceeds size_limit, finalize current ZIP and start new
-        if current_size + data_size > size_limit and current_size > 0:
-            zip_bytes = finalize_zip(zf, current_zip_file, part_index)
+        fname = key.split("_", 1)[1]
+        file_size = len(data)
+        # If adding this would exceed limit, finalize current and start a new one
+        if current_size + file_size > size_limit and current_size > 0:
+            zip_bytes = finalize_zip(zf, current_zip_file)
             zips.append((f"attachments_part{part_index}.zip", zip_bytes))
             part_index += 1
-            # Start new ZIP
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
             current_zip_file = tmp.name
             zf = zipfile.ZipFile(current_zip_file, mode="w", compression=zipfile.ZIP_DEFLATED)
             current_size = 0
 
-        # Write this attachment to the current ZIP
         zf.writestr(fname, data)
-        current_size += data_size
+        current_size += file_size
 
-    # Finalize last ZIP
-    if zf and current_size >= 0:
-        zip_bytes = finalize_zip(zf, current_zip_file, part_index)
+    # Finalize last
+    if zf:
+        zip_bytes = finalize_zip(zf, current_zip_file)
         zips.append((f"attachments_part{part_index}.zip", zip_bytes))
 
     return zips
@@ -297,8 +307,8 @@ st.title("Email Forensic Tool (.msg ZIP)")
 
 st.write(
     "Upload a ZIP containing `.msg` files (eDiscovery export). "
-    "The app will extract and parse every .msg, then present a searchable table, "
-    "including each email’s body and any attachments. "
+    "The app will extract and parse every .msg using msg_parser (so bodies appear correctly), "
+    "then present a searchable table including each email’s body and any attachments. "
     "You can also download all attachments split into multiple ZIP parts under 190 MB each."
 )
 
@@ -318,7 +328,7 @@ if uploaded:
         st.info("No `.msg` files were found in the uploaded ZIP.")
         st.stop()
 
-    # Build a DataFrame for display & filtering
+    # Build DataFrame for display/filtering
     df = pd.DataFrame([{
         "Date": msg.get("date"),
         "Subject": msg.get("subject"),
@@ -330,7 +340,6 @@ if uploaded:
         "Index": i
     } for i, msg in enumerate(messages)])
 
-    # Ensure Date is a datetime
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
     # Sidebar filters
@@ -345,7 +354,7 @@ if uploaded:
     start_date = st.sidebar.date_input("Start date", value=datetime(2000, 1, 1).date())
     end_date = st.sidebar.date_input("End date", value=datetime.today().date())
 
-    # Apply filters to the parsed messages
+    # Apply filters
     filtered = []
     for msg in messages:
         if subj_filter and subj_filter.lower() not in msg["subject"].lower():
@@ -385,7 +394,7 @@ if uploaded:
         disp_df["Date"] = disp_df["Date"].dt.strftime("%Y-%m-%d %H:%M:%S")
         st.dataframe(disp_df.set_index("Index"), height=400)
 
-        # Download filtered results as CSV or PDF
+        # Download filtered as CSV / PDF
         st.download_button(
             "Download Filtered as CSV",
             data=generate_csv_download(filtered),
@@ -401,15 +410,14 @@ if uploaded:
             key="download_filtered_pdf"
         )
 
-        # Split and download all attachments from filtered messages
-        # Gather keys of attachments present in filtered messages
+        # Split & download all attachments for filtered messages
         filtered_keys = []
         for msg in filtered:
-            for _, key in msg["attachments"]:
+            for fname_key in msg["attachments"]:
+                _, key = fname_key
                 filtered_keys.append(key)
 
         if filtered_keys:
-            # Build a sub-dictionary of attachments_storage
             filtered_attachments = {k: attachments_storage[k] for k in filtered_keys}
             parts = create_split_zips(filtered_attachments)
             st.write("## Download Attachments (Split ZIPs)")
@@ -451,7 +459,7 @@ if uploaded:
         st.write("**Body:**")
         st.write(msg["body"])
 
-        # Download just this message as a one-page PDF
+        # Download this message as PDF
         single_pdf = generate_single_pdf(msg)
         st.download_button(
             "Download This Message as PDF",
