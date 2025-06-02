@@ -1,4 +1,3 @@
-pandas
-pypff
-reportlab
 streamlit
+pandas
+reportlab
