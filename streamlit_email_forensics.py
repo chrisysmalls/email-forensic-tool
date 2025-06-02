@@ -19,7 +19,7 @@ import extract_msg
 # .msg Parsing
 # ----------------------------------------
 @st.cache_data
- def parse_msg_files(_msg_files):
+def parse_msg_files(_msg_files):
     """
     Parse a list of .msg files (UploadedFile-like objects).
     Returns (messages, attachments_storage).
@@ -38,7 +38,7 @@ import extract_msg
             tmp_path = tmp.name
 
         msg = extract_msg.Message(tmp_path)
-        msg_sender  = msg.sender or ""
+        msg_sender = msg.sender or ""
         msg_subject = msg.subject or ""
 
         try:
@@ -48,8 +48,8 @@ import extract_msg
         except Exception:
             msg_date = datetime.fromtimestamp(0)
 
-        to_field  = msg.to or ""
-        cc_field  = msg.cc or ""
+        to_field = msg.to or ""
+        cc_field = msg.cc or ""
         bcc_field = msg.bcc or ""
         recipients = ", ".join(filter(None, [to_field, cc_field, bcc_field]))
 
@@ -65,8 +65,8 @@ import extract_msg
         attachments = []
         for att in msg.attachments:
             fname = att.longFilename or att.shortFilename or "attachment"
-            data  = att.data
-            key   = f"{len(attachments_storage)}_{fname}"
+            data = att.data
+            key = f"{len(attachments_storage)}_{fname}"
             attachments_storage[key] = data
             attachments.append((fname, key))
 
@@ -86,11 +86,12 @@ import extract_msg
 
     return messages, attachments_storage
 
+
 # ----------------------------------------
 # ZIP Handling: extract .msg files inside
 # ----------------------------------------
 @st.cache_data
- def parse_zip_file(uploaded_zip):
+def parse_zip_file(uploaded_zip):
     """
     Extract all .msg files from uploaded ZIP and parse them.
     Returns (messages, attachments_storage).
@@ -113,6 +114,7 @@ import extract_msg
             def __init__(self, path):
                 self.name = os.path.basename(path)
                 self._path = path
+
             def read(self):
                 with open(self._path, "rb") as f:
                     return f.read()
@@ -120,11 +122,12 @@ import extract_msg
         msg_uploads = [_TmpUploaded(p) for p in msg_file_paths]
         return parse_msg_files(msg_uploads)
 
+
 # ----------------------------------------
 # CSV / PDF Export Helpers
 # ----------------------------------------
 @st.cache_data
- def generate_csv_download(messages):
+def generate_csv_download(messages):
     df = pd.DataFrame([{
         "Date": msg.get("date"),
         "Subject": msg.get("subject"),
@@ -144,8 +147,9 @@ import extract_msg
 
     return df.to_csv(index=False).encode("utf-8")
 
+
 @st.cache_data
- def generate_pdf_download(messages):
+def generate_pdf_download(messages):
     buffer = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     doc = SimpleDocTemplate(buffer.name, pagesize=letter)
     elements = []
@@ -161,7 +165,7 @@ import extract_msg
     ]]
 
     for msg in messages:
-        date_str        = msg["date"].strftime("%Y-%m-%d %H:%M:%S") if msg.get("date") else ""
+        date_str = msg["date"].strftime("%Y-%m-%d %H:%M:%S") if msg.get("date") else ""
         attachments_text = ";".join([
             att if isinstance(att, str) else att[0]
             for att in msg.get("attachments", [])
@@ -196,7 +200,11 @@ import extract_msg
     os.unlink(buffer.name)
     return data
 
- def generate_single_pdf(msg):
+
+def generate_single_pdf(msg):
+    """
+    Create a PDF (bytes) for a single message, formatted as a detailed report.
+    """
     buffer = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     doc = SimpleDocTemplate(buffer.name, pagesize=letter)
     elements = []
@@ -227,37 +235,144 @@ import extract_msg
     os.unlink(buffer.name)
     return data
 
+
 # ----------------------------------------
 # Streamlit Interface
 # ----------------------------------------
- st.title("Email Forensic Tool (.msg ZIP)")
+st.title("Email Forensic Tool (.msg ZIP)")
 
- st.write(
-     "Upload a ZIP containing `.msg` files (eDiscovery export). "
-     "The app will extract and parse every .msg, then present a searchable table, "
-     "including each email’s body and any attachments."
- )
+st.write(
+    "Upload a ZIP containing `.msg` files (eDiscovery export). "
+    "The app will extract and parse every .msg, then present a searchable table, "
+    "including each email’s body and any attachments."
+)
 
- uploaded = st.file_uploader(
-     "Upload a ZIP of .msg files (single ZIP only)", type=["zip"]
- )
+uploaded = st.file_uploader(
+    "Upload a ZIP of .msg files (single ZIP only)", type=["zip"]
+)
 
- if uploaded:
-     with st.spinner("Extracting and parsing .msg files…"):
-         try:
-             messages, attachments_storage = parse_zip_file(uploaded)
-         except Exception as e:
-             st.error(f"Failed to parse ZIP: {e}")
-             st.stop()
+if uploaded:
+    with st.spinner("Extracting and parsing .msg files…"):
+        try:
+            messages, attachments_storage = parse_zip_file(uploaded)
+        except Exception as e:
+            st.error(f"Failed to parse ZIP: {e}")
+            st.stop()
 
-     if not messages:
-         st.info("No `.msg` files were found in the uploaded ZIP.")
-         st.stop()
+    if not messages:
+        st.info("No `.msg` files were found in the uploaded ZIP.")
+        st.stop()
 
-     df = pd.DataFrame([{ 
-         "Date": msg.get("date"),
-         "Subject": msg.get("subject"),
-         "Sender": msg.get("sender"),
-         "Recipients": msg.get("recipients"),
-         "EmailsInBody": msg.get("emails_in_body"),
-         "PhonesInBody": msg.get("phones_in_body"),
+    # Build a DataFrame for display & filtering
+    df = pd.DataFrame([{
+        "Date": msg.get("date"),
+        "Subject": msg.get("subject"),
+        "Sender": msg.get("sender"),
+        "Recipients": msg.get("recipients"),
+        "EmailsInBody": msg.get("emails_in_body"),
+        "PhonesInBody": msg.get("phones_in_body"),
+        "AttachmentsCount": len(msg.get("attachments", [])),
+        "Index": i
+    } for i, msg in enumerate(messages)])
+
+    # Ensure Date is a datetime
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    # Sidebar filters
+    st.sidebar.header("Filters")
+    subj_filter = st.sidebar.text_input("Subject contains")
+    sender_filter = st.sidebar.text_input("Sender contains")
+    rec_filter = st.sidebar.text_input("Communicated with (email/domain)")
+    email_filter = st.sidebar.text_input("Email in body contains")
+    phone_filter = st.sidebar.text_input("Phone in body contains")
+    body_filter = st.sidebar.text_input("Body contains (any text/address/etc.)")
+    has_attach = st.sidebar.checkbox("Only show messages with attachments")
+    start_date = st.sidebar.date_input("Start date", value=datetime(2000, 1, 1).date())
+    end_date = st.sidebar.date_input("End date", value=datetime.today().date())
+
+    # Apply filters to the parsed messages
+    filtered = []
+    for msg in messages:
+        if subj_filter and subj_filter.lower() not in msg["subject"].lower():
+            continue
+        if sender_filter and sender_filter.lower() not in msg["sender"].lower():
+            continue
+        if rec_filter:
+            low = rec_filter.lower()
+            if low not in msg["sender"].lower() and low not in msg["recipients"].lower():
+                continue
+        if email_filter and email_filter.lower() not in msg["emails_in_body"].lower():
+            continue
+        if phone_filter and phone_filter.lower() not in msg["phones_in_body"].lower():
+            continue
+        if body_filter and body_filter.lower() not in msg["body"].lower():
+            continue
+        if has_attach and len(msg["attachments"]) == 0:
+            continue
+        msg_date = msg["date"]
+        if msg_date:
+            if msg_date.date() < start_date or msg_date.date() > end_date:
+                continue
+        filtered.append(msg)
+
+    if filtered:
+        disp_df = pd.DataFrame([{
+            "Date": msg.get("date"),
+            "Subject": msg.get("subject"),
+            "Sender": msg.get("sender"),
+            "Recipients": msg.get("recipients"),
+            "EmailsInBody": msg.get("emails_in_body"),
+            "PhonesInBody": msg.get("phones_in_body"),
+            "AttachmentsCount": len(msg.get("attachments", [])),
+            "Index": i
+        } for i, msg in enumerate(messages) if msg in filtered])
+
+        disp_df["Date"] = disp_df["Date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        st.dataframe(disp_df.set_index("Index"), height=400)
+
+        # Download filtered results as CSV or PDF
+        st.download_button(
+            "Download Filtered as CSV",
+            data=generate_csv_download(filtered),
+            file_name="filtered_emails.csv",
+            mime="text/csv"
+        )
+        st.download_button(
+            "Download Filtered as PDF",
+            data=generate_pdf_download(filtered),
+            file_name="filtered_emails.pdf",
+            mime="application/pdf"
+        )
+
+        # Detailed view for a single message
+        st.write("## Message Details & Attachments")
+        idx_list = disp_df.index.tolist()
+        selected_index = st.selectbox("Select message by Index", options=idx_list)
+        msg = [m for i, m in enumerate(messages) if i == selected_index][0]
+
+        st.write(f"**Date:** {msg['date'].strftime('%Y-%m-%d %H:%M:%S')}")
+        st.write(f"**Subject:** {msg['subject']}")
+        st.write(f"**Sender:** {msg['sender']}")
+        st.write(f"**Recipients:** {msg['recipients']}")
+
+        if msg["attachments"]:
+            st.write("**Attachments:**")
+            for att in msg["attachments"]:
+                fn, key = att
+                data = attachments_storage.get(key)
+                if data:
+                    st.download_button(f"Download {fn}", data=data, file_name=fn)
+
+        st.write("**Body:**")
+        st.write(msg["body"])
+
+        # Download just this message as a one-page PDF
+        single_pdf = generate_single_pdf(msg)
+        st.download_button(
+            "Download This Message as PDF",
+            data=single_pdf,
+            file_name=f"message_{selected_index}.pdf",
+            mime="application/pdf"
+        )
+    else:
+        st.info("No messages match the current filters.")
