@@ -179,7 +179,7 @@ def generate_pdf_download(filtered_messages):
     return data
 
 st.title("Email Forensic Tool - Streamlit Edition")
-uploaded_file = st.file_uploader("Upload a .pst or .csv file", type=["pst", "csv"] )
+uploaded_file = st.file_uploader("Upload a .pst or .csv file", type=["pst", "csv"])
 if uploaded_file:
     ext = os.path.splitext(uploaded_file.name)[1].lower()
     if ext == ".pst":
@@ -202,18 +202,24 @@ if uploaded_file:
     rec_filter = st.sidebar.text_input("Recipient contains")
     email_filter = st.sidebar.text_input("Email in body contains")
     phone_filter = st.sidebar.text_input("Phone in body contains")
-    start_date = st.sidebar.date_input("Start date", value=datetime(2000,1,1).date())
+    start_date = st.sidebar.date_input("Start date", value=datetime(2000, 1, 1).date())
     end_date = st.sidebar.date_input("End date", value=datetime.today().date())
     filtered = []
     for msg in messages:
-        if subj_filter and subj_filter.lower() not in msg.get("subject", "").lower(): continue
-        if sender_filter and sender_filter.lower() not in msg.get("sender", "").lower(): continue
-        if rec_filter and rec_filter.lower() not in msg.get("recipients", "").lower(): continue
-        if email_filter and email_filter.lower() not in msg.get("emails_in_body", "").lower(): continue
-        if phone_filter and phone_filter.lower() not in msg.get("phones_in_body", "").lower(): continue
+        if subj_filter and subj_filter.lower() not in msg.get("subject", "").lower():
+            continue
+        if sender_filter and sender_filter.lower() not in msg.get("sender", "").lower():
+            continue
+        if rec_filter and rec_filter.lower() not in msg.get("recipients", "").lower():
+            continue
+        if email_filter and email_filter.lower() not in msg.get("emails_in_body", "").lower():
+            continue
+        if phone_filter and phone_filter.lower() not in msg.get("phones_in_body", "").lower():
+            continue
         msg_date = msg.get("date")
         if msg_date:
-            if msg_date.date() < start_date or msg_date.date() > end_date: continue
+            if msg_date.date() < start_date or msg_date.date() > end_date:
+                continue
         filtered.append(msg)
     if filtered:
         display_df = pd.DataFrame([{
@@ -236,9 +242,9 @@ if uploaded_file:
         if selected_msgs:
             msg = selected_msgs[0]
             st.write(f"**Date:** {msg.get('date').strftime('%Y-%m-%d %H:%M:%S')}")
-            st.write(f"**Subject:** {msg.get('subject')}" )
-            st.write(f"**Sender:** {msg.get('sender')}" )
-            st.write(f"**Recipients:** {msg.get('recipients')}" )
+            st.write(f"**Subject:** {msg.get('subject')}")
+            st.write(f"**Sender:** {msg.get('sender')}")
+            st.write(f"**Recipients:** {msg.get('recipients')}")
             if msg.get("attachments"):
                 st.write("**Attachments:**")
                 for filename, key in msg.get("attachments"):
