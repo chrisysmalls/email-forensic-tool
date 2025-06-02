@@ -33,7 +33,8 @@ def parse_csv(file_obj):
           emails_in_body, phones_in_body, attachments (list of filenames)
       - column_map: mapping of detected column names (for reference)
     """
-    df = pd.read_csv(file_obj, encoding="utf-8", errors="ignore")
+    # Read the entire CSV into a DataFrame
+    df = pd.read_csv(file_obj, encoding="utf-8")
     cols = list(df.columns)
     cols_lower = [c.lower() for c in cols]
 
@@ -53,14 +54,16 @@ def parse_csv(file_obj):
     body_col = find_col(["body", "content", "text"])
     attach_col = find_col(["attach"])
 
+    # Convert the detected date column to datetime if it exists
     if date_col:
         try:
-            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            df[date_col] = pd.to_datetime(df[date_col])
         except Exception:
             df[date_col] = pd.to_datetime(df[date_col].astype(str), errors="coerce")
 
     messages = []
     for _, row in df.iterrows():
+        # Date
         if date_col and not pd.isna(row.get(date_col)):
             date = row.get(date_col)
             if not isinstance(date, datetime):
@@ -71,9 +74,13 @@ def parse_csv(file_obj):
         else:
             date = datetime.fromtimestamp(0)
 
+        # Subject
         subject = str(row.get(subject_col, "")) if subject_col else ""
+
+        # Sender
         sender = str(row.get(sender_col, "")) if sender_col else ""
 
+        # Recipients: combine To, CC, BCC if present
         rec_list = []
         if to_col:
             rec_to = str(row.get(to_col, "")) or ""
@@ -89,7 +96,10 @@ def parse_csv(file_obj):
                 rec_list.append(rec_bcc)
         recipients = ", ".join(rec_list)
 
+        # Body
         body = str(row.get(body_col, "")) if body_col else ""
+
+        # Extract email addresses and phone numbers from the body
         emails_in_body = re.findall(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", body)
         phones_in_body = re.findall(
             r"(\+?\d{1,3}[-\.\s]?)?\(?\d{3}\)?[-\.\s]?\d{3}[-\.\s]?\d{4}", body
@@ -98,6 +108,7 @@ def parse_csv(file_obj):
         phones_in_body = ["".join(p) for p in phones_in_body]
         phones_in_body = list(set(phones_in_body))
 
+        # Attachments
         attachments = []
         if attach_col:
             raw = str(row.get(attach_col, "")) or ""
@@ -128,6 +139,7 @@ def parse_csv(file_obj):
         "attachments": attach_col
     }
     return messages, column_map
+
 
 # ----------------------------------------
 # CSV / PDF Export Helpers
@@ -205,6 +217,7 @@ def generate_pdf_download(filtered_messages):
     os.unlink(buffer.name)
     return data
 
+
 def generate_single_pdf(msg):
     """
     Create a PDF (bytes) for a single message, with detailed view.
@@ -240,6 +253,7 @@ def generate_single_pdf(msg):
         data = f.read()
     os.unlink(buffer.name)
     return data
+
 
 # ----------------------------------------
 # Streamlit Interface
@@ -352,10 +366,9 @@ if uploaded:
         st.write("**Body:**")
         st.write(msg["body"])
 
-        # Download single-message report as PDF
         pdf_data = generate_single_pdf(msg)
         st.download_button(
-            "Download This Message as PDF",
+            "Download This Communication's Report as PDF",
             data=pdf_data,
             file_name=f"message_{selected_index}.pdf",
             mime="application/pdf"
