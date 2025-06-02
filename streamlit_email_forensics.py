@@ -11,6 +11,9 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 
+# For .msg parsing
+import extract_msg
+
 # ----------------------------------------
 # CSV Parsing with Auto‐Column Detection
 # ----------------------------------------
@@ -25,15 +28,8 @@ def parse_csv(file_obj):
       - recipients: 'to', 'cc', 'bcc' (combines all found)
       - body (containing 'body', 'content', or 'text')
       - attachments (containing 'attach')
-
-    Returns:
-      - messages: list of dicts with fields:
-          date (datetime or timestamp 0),
-          subject, sender, recipients, body,
-          emails_in_body, phones_in_body, attachments (list of filenames)
-      - column_map: mapping of detected column names (for reference)
+    Returns messages (list of dicts) and column_map.
     """
-    # Read the entire CSV into a DataFrame
     df = pd.read_csv(file_obj, encoding="utf-8")
     cols = list(df.columns)
     cols_lower = [c.lower() for c in cols]
@@ -54,7 +50,6 @@ def parse_csv(file_obj):
     body_col = find_col(["body", "content", "text"])
     attach_col = find_col(["attach"])
 
-    # Convert the detected date column to datetime if it exists
     if date_col:
         try:
             df[date_col] = pd.to_datetime(df[date_col])
@@ -63,7 +58,6 @@ def parse_csv(file_obj):
 
     messages = []
     for _, row in df.iterrows():
-        # Date
         if date_col and not pd.isna(row.get(date_col)):
             date = row.get(date_col)
             if not isinstance(date, datetime):
@@ -74,13 +68,9 @@ def parse_csv(file_obj):
         else:
             date = datetime.fromtimestamp(0)
 
-        # Subject
         subject = str(row.get(subject_col, "")) if subject_col else ""
-
-        # Sender
         sender = str(row.get(sender_col, "")) if sender_col else ""
 
-        # Recipients: combine To, CC, BCC if present
         rec_list = []
         if to_col:
             rec_to = str(row.get(to_col, "")) or ""
@@ -96,10 +86,7 @@ def parse_csv(file_obj):
                 rec_list.append(rec_bcc)
         recipients = ", ".join(rec_list)
 
-        # Body
         body = str(row.get(body_col, "")) if body_col else ""
-
-        # Extract email addresses and phone numbers from the body
         emails_in_body = re.findall(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", body)
         phones_in_body = re.findall(
             r"(\+?\d{1,3}[-\.\s]?)?\(?\d{3}\)?[-\.\s]?\d{3}[-\.\s]?\d{4}", body
@@ -108,7 +95,6 @@ def parse_csv(file_obj):
         phones_in_body = ["".join(p) for p in phones_in_body]
         phones_in_body = list(set(phones_in_body))
 
-        # Attachments
         attachments = []
         if attach_col:
             raw = str(row.get(attach_col, "")) or ""
@@ -140,6 +126,74 @@ def parse_csv(file_obj):
     }
     return messages, column_map
 
+# ----------------------------------------
+# .msg Parsing
+# ----------------------------------------
+@st.cache_data
+def parse_msg_files(msg_files):
+    """
+    Parse a list of .msg files (UploadedFile objects).
+    Returns messages (list of dicts) and attachments_storage {key: bytes}.
+    """
+    messages = []
+    attachments_storage = {}
+
+    for uploaded in msg_files:
+        # Save to temp file for extract_msg
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".msg") as tmp:
+            tmp.write(uploaded.read())
+            tmp_path = tmp.name
+
+        msg = extract_msg.Message(tmp_path)
+        msg_sender = msg.sender or ""
+        msg_subject = msg.subject or ""
+        try:
+            msg_date = msg.date
+            if isinstance(msg_date, str):
+                msg_date = datetime.strptime(msg_date, "%m/%d/%Y %H:%M:%S %p")
+        except Exception:
+            msg_date = datetime.fromtimestamp(0)
+
+        # Recipients: To, CC, BCC fields from extract_msg
+        to_field = msg.to or ""
+        cc_field = msg.cc or ""
+        bcc_field = msg.bcc or ""
+        recipients = ", ".join(filter(None, [to_field, cc_field, bcc_field]))
+
+        # Body (plaintext)
+        body = msg.body or ""
+        emails_in_body = re.findall(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", body)
+        phones_in_body = re.findall(
+            r"(\+?\d{1,3}[-\.\s]?)?\(?\d{3}\)?[-\.\s]?\d{3}[-\.\s]?\d{4}", body
+        )
+        emails_in_body = list(set(emails_in_body))
+        phones_in_body = ["".join(p) for p in phones_in_body]
+        phones_in_body = list(set(phones_in_body))
+
+        # Attachments: extract_msg gives msg.attachments (list)
+        attachments = []
+        for att in msg.attachments:
+            fname = att.longFilename or att.shortFilename or "attachment"
+            data = att.data
+            key = f"{len(attachments_storage)}_{fname}"
+            attachments_storage[key] = data
+            attachments.append((fname, key))
+
+        messages.append({
+            "date": msg_date,
+            "subject": msg_subject,
+            "sender": msg_sender,
+            "recipients": recipients,
+            "body": body,
+            "emails_in_body": ", ".join(emails_in_body),
+            "phones_in_body": ", ".join(phones_in_body),
+            "attachments": attachments,
+        })
+
+        msg.close()
+        os.unlink(tmp_path)
+
+    return messages, attachments_storage
 
 # ----------------------------------------
 # CSV / PDF Export Helpers
@@ -153,7 +207,10 @@ def generate_csv_download(filtered_messages):
         "Recipients": msg.get("recipients"),
         "EmailsInBody": msg.get("emails_in_body"),
         "PhonesInBody": msg.get("phones_in_body"),
-        "Attachments": ";".join(msg.get("attachments", [])),
+        "Attachments": ";".join([
+            att if isinstance(att, str) else att[0]
+            for att in msg.get("attachments", [])
+        ]),
         "Body": msg.get("body"),
     } for msg in filtered_messages])
 
@@ -161,7 +218,6 @@ def generate_csv_download(filtered_messages):
         df["Date"] = df["Date"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
     return df.to_csv(index=False).encode("utf-8")
-
 
 @st.cache_data
 def generate_pdf_download(filtered_messages):
@@ -175,18 +231,16 @@ def generate_pdf_download(filtered_messages):
     elements.append(Spacer(1, 12))
 
     table_data = [[
-        "Date",
-        "Subject",
-        "Sender",
-        "Recipients",
-        "Emails In Body",
-        "Phones In Body",
-        "Attachments"
+        "Date", "Subject", "Sender", "Recipients",
+        "Emails In Body", "Phones In Body", "Attachments"
     ]]
 
     for msg in filtered_messages:
         date_str = msg["date"].strftime("%Y-%m-%d %H:%M:%S") if msg.get("date") else ""
-        attachments_text = ";".join(msg.get("attachments", []))
+        attachments_text = ";".join([
+            att if isinstance(att, str) else att[0]
+            for att in msg.get("attachments", [])
+        ])
 
         row = [
             date_str,
@@ -217,17 +271,15 @@ def generate_pdf_download(filtered_messages):
     os.unlink(buffer.name)
     return data
 
-
 def generate_single_pdf(msg):
     """
-    Create a PDF (bytes) for a single message, with detailed view.
+    Create a PDF (bytes) for a single message, formatted as a detailed report.
     """
     buffer = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     doc = SimpleDocTemplate(buffer.name, pagesize=letter)
     elements = []
     styles = getSampleStyleSheet()
 
-    # Headers
     elements.append(Paragraph(f"Date: {msg['date'].strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]))
     elements.append(Paragraph(f"Subject: {msg['subject']}", styles["Normal"]))
     elements.append(Paragraph(f"Sender: {msg['sender']}", styles["Normal"]))
@@ -239,7 +291,6 @@ def generate_single_pdf(msg):
         for fn in msg["attachments"]:
             elements.append(Paragraph(f"• {fn}", styles["Normal"]))
 
-    # Body
     elements.append(Spacer(1, 12))
     elements.append(Paragraph("Body:", styles["Normal"]))
     for line in msg["body"].split("\n"):
@@ -254,26 +305,50 @@ def generate_single_pdf(msg):
     os.unlink(buffer.name)
     return data
 
-
 # ----------------------------------------
 # Streamlit Interface
 # ----------------------------------------
-st.title("Email Forensic Tool (CSV-Only)")
+st.title("Email Forensic Tool (.csv + .msg)")
 
-uploaded = st.file_uploader("Upload a CSV file", type=["csv"])
+uploaded = st.file_uploader(
+    "Upload CSV or .msg files (multi‐select allowed for .msg)",
+    type=["csv", "msg"], accept_multiple_files=True
+)
 
 if uploaded:
-    with st.spinner("Parsing CSV…"):
-        try:
-            messages, column_map = parse_csv(uploaded)
-        except Exception as e:
-            st.error(f"Failed to parse CSV: {e}")
-            st.stop()
+    # Separate .csv and .msg uploads
+    csv_files = [u for u in uploaded if u.name.lower().endswith(".csv")]
+    msg_files = [u for u in uploaded if u.name.lower().endswith(".msg")]
 
-    st.write("**Detected columns:**")
-    for key, col in column_map.items():
-        st.write(f"- {key.capitalize()}: {col or '—'}")
+    messages = []
+    attachments_storage = {}
 
+    # Parse any CSVs
+    for csv_file in csv_files:
+        with st.spinner(f"Parsing CSV: {csv_file.name}..."):
+            try:
+                msgs, col_map = parse_csv(csv_file)
+                messages.extend(msgs)
+            except Exception as e:
+                st.error(f"Failed to parse CSV {csv_file.name}: {e}")
+                st.stop()
+
+    # Parse any .msgs
+    if msg_files:
+        with st.spinner("Parsing .msg files..."):
+            try:
+                msgs, attach_store = parse_msg_files(msg_files)
+                messages.extend(msgs)
+                attachments_storage.update(attach_store)
+            except Exception as e:
+                st.error(f"Failed to parse .msg: {e}")
+                st.stop()
+
+    if not messages:
+        st.info("No messages found in uploads.")
+        st.stop()
+
+    # Build DataFrame to display/filter
     df = pd.DataFrame([{
         "Date": msg.get("date"),
         "Subject": msg.get("subject"),
@@ -285,6 +360,7 @@ if uploaded:
         "Index": i
     } for i, msg in enumerate(messages)])
 
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     st.sidebar.header("Filters")
     subj_filter = st.sidebar.text_input("Subject contains")
     sender_filter = st.sidebar.text_input("Sender contains")
@@ -360,8 +436,14 @@ if uploaded:
 
         if msg["attachments"]:
             st.write("**Attachments:**")
-            for fn in msg["attachments"]:
-                st.write(f"• {fn}")
+            for att in msg["attachments"]:
+                if isinstance(att, str):
+                    st.write(f"• {att}")
+                else:
+                    fn, key = att
+                    data = attachments_storage.get(key)
+                    if data:
+                        st.download_button(f"Download {fn}", data=data, file_name=fn)
 
         st.write("**Body:**")
         st.write(msg["body"])
